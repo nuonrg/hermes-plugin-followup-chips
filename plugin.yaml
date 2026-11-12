@@ -1,0 +1,13 @@
+name: followup-chips
+label: Follow-up Chips
+version: 1.0.0
+author: nuonrg
+homepage: https://github.com/nuonrg/hermes-plugin-followup-chips
+description: >
+  Clickable follow-up question chips under Hermes Desktop chat replies. The
+  agent ends a reply with a ::followups directive; each question renders as a
+  chip and one click sends it as the next user turn. Hermes arc-border hover,
+  the arc keeps running while the agent answers and rests on a checkmark when
+  done. Per-block choice state persists across reloads; every new block starts
+  blank. Desktop-only (desktop/plugin.js); no agent tools, hooks or env vars.
+tags: [desktop, ux, chat]

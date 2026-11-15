@@ -1,6 +1,6 @@
 name: followup-chips
 label: Follow-up Chips
-version: 1.0.4
+version: 1.0.5
 author: nuonrg
 homepage: https://github.com/nuonrg/hermes-plugin-followup-chips
 description: >
@@ -11,7 +11,8 @@ description: >
   that way instead of asking "say the word and I'll...". With rec="1,3" the
   options a decision classifier prefers carry a Recommended tag, keep the accent
   tint, and start out picked; its followup_recommend tool can name more than one
-  when several steps belong together. Recommendations are optional: they need the
+  when several steps belong together, but never all of them, never two that are
+  alternatives or contradict, and never a "none of these" option beside an action. Recommendations are optional: they need the
   separate nerve classifier plugin, and without it the chips work exactly the same
   and are simply never marked. Every chip in a block shares one width, set
   by the longest option, so a row of short actions still reads as a column. An

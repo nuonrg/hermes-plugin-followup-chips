@@ -73,7 +73,16 @@ followup_recommend(options=["Push the branch", "Tag a release", "Write the notes
 → Recommended 1 of 3: 1 (0.91). Write rec="1" into the directive.
 ```
 
-One `choice` question per option rides in a single classifier call (about 200 ms), so a five-option reply still costs one call. The policy is in code, not in the model: every option at or above **0.5** on "take it now" is recommended, at most 3, weakest dropped first. More than one can clear the bar, which is the point: three steps that all have to happen come back 0.81 / 0.79 / 0.77 and all three are tagged, while a reply with one obvious next step comes back 0.91 / 0.04 / 0.04 and only that one is.
+One `choice` question per option rides in a single classifier call (200-350 ms), so a five-option reply still costs one call. The payload is built so the classifier can see the choice it is judging: the state lists the candidates numbered, and each question names the other options, because "take it now" cannot be true of two options that are alternatives to each other.
+
+The policy is in code, not in the model, and four rules decide what gets marked:
+
+- an option is recommended when it clears **0.5** on "take it now" and beats both "later" and "skip", so a 0.51 beside a 0.49 skip is not a verdict;
+- a **"none of these" option** (a deferral such as "Wait for review" counts as one) is never marked beside another option, and only when it is preferred over every other option, because taking a step and taking no step cannot both be right;
+- **every option clearing the bar is not a recommendation**: the weakest is left out, so two options cannot both be marked;
+- at most **3** survive, strongest first.
+
+More than one can still be marked, which is the point when the steps genuinely belong together; what cannot happen is all of them, or two that contradict. When nothing clears, the tool reports the highest score so the model can see how close it was.
 
 When no classifier is loaded, or the owner turns **Ask the decision classifier which steps to pick** off (`auto_recommend`), the tool answers "leave rec out": no tag, no pre-pick, and nothing else about the reply changes. A classifier error never changes a reply either, so a missing, slow or broken `nerve` costs you a recommendation and never a message.
 

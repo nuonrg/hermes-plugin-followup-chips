@@ -7,11 +7,22 @@ chips render unmarked while everything else keeps working. Nothing in this modul
 is imported by the renderer, and nothing about the directive depends on it.
 
 One `nerve_assess` call carries a question per option (up to 16 typed questions on
-one shared state), so five options still cost one provider call of about 200 ms.
-Every option the classifier puts at or above `MIN_TAKE_NOW` is recommended. That is
-how more than one can be recommended at once: a categorical distribution can
-clearly favour several candidates when they belong together, and the live shape is
-0.81 / 0.79 / 0.77 for three steps that all have to happen.
+one shared state), so five options still cost one provider call of 200-350 ms.
+
+The payload gives the classifier what it cannot see on its own: the state lists the
+candidates numbered, and every question names the other options. A candidate that is
+an *alternative* to another cannot be judged in isolation, because "take it now" is
+true of only one of a pair that shares a goal, contradicts itself, or differs only in
+when it happens. A candidate that means taking none of the others is the same problem
+in a sharper form: taking a step and taking no step cannot both be right.
+
+The policy is code, not a prompt. An option is recommended when it clears
+`MIN_TAKE_NOW` and beats both other labels, and three rules keep the result sane:
+
+- a "take none of these" option is never recommended beside another option, and only
+  when it is preferred over every other option;
+- every option clearing the bar is not a recommendation, so the weakest is left out;
+- at most `MAX_RECOMMENDED` survive, strongest first.
 
 No model is involved in the decision: labels in, indexes out. Nothing is
 recommended when no classifier answers, and the directive stays valid without a
@@ -38,10 +49,46 @@ MAX_OPTIONS = 6
 
 DEFAULT_STATE = "The assistant just finished a reply and is offering the user a few next steps."
 
+# Options that mean "take none of these", waiting included: pushing now and waiting
+# for review are one decision at two times, so they are alternatives and not
+# companions. Substring matching on purpose, because these are chip labels written by
+# a model, not prose to parse.
+NONE_MARKERS = (
+    "none of the",
+    "none of these",
+    "none of them",
+    "none at all",
+    "nothing",
+    "neither",
+    "do nothing",
+    "no action",
+    "skip",
+    "not now",
+    "not yet",
+    "hold off",
+    "wait",
+    "defer",
+    "postpone",
+    "leave it",
+    "leave that",
+    "don't",
+    "do not",
+    "later",
+    "tomorrow",
+    "not worth",
+)
+
 ANSWER_INSTRUCTIONS = (
-    "Should the assistant take this candidate next step right now, given the user's request "
-    "and the work the reply just described? Judge it on its own: more than one candidate can "
-    "deserve to be taken now."
+    "Judge this candidate on its own: more than one can deserve to be taken now. But when "
+    "another option is an alternative to it, meaning a different route to the same goal, its "
+    "opposite, or the same step at another time, then only one of that pair can be taken: the "
+    "one that defers, waits or undoes the other is not 'take it now' unless the user clearly "
+    "prefers it. Do not mark two alternatives both."
+)
+
+NONE_INSTRUCTIONS = (
+    "This candidate means taking none of the others. It earns 'take it now' only when the user "
+    "would rather not act, or would rather wait, than take any of the other options here."
 )
 
 CRITERIA = {
@@ -51,17 +98,45 @@ CRITERIA = {
 }
 
 
-def questions(options: list[str]) -> dict[str, dict]:
-    """One typed question per option, keyed by its chip number.
+def is_none_option(option: object) -> bool:
+    """Does this option mean "take none of these", a deferral included?"""
+    text = " " + str(option or "").casefold() + " "
+    return any(marker in text for marker in NONE_MARKERS)
 
-    ["Push it", "Tag it"] → {"q1": {"type": "choice", "instructions": "Option: Push it. Should …",
-    "criteria": {"take it now": …, "later": …, "skip": …}}, "q2": {…}}
+
+def state_for(options: list[str], context: str = "") -> str:
+    """The shared state: the goal, then every candidate numbered as the chips show them."""
+    goal = str(context or "").strip() or DEFAULT_STATE
+    numbered = "\n".join("%d. %s" % (index + 1, option) for index, option in enumerate(options))
+    return (
+        "%s\n\nThe candidate next steps, numbered as the chips will show them:\n%s\n\n"
+        "Several candidates can be worth taking now, but two that are alternatives cannot both "
+        "be: a different route to the same goal, the opposite of another, or the same step at "
+        "another time. A candidate that means taking none of the others is only worth taking "
+        "when it is preferred over all of them, and never beside one of them." % (goal, numbered)
+    )
+
+
+def questions(options: list[str]) -> dict[str, dict]:
+    """One typed question per option, keyed by its chip number, each naming its siblings.
+
+    ["Push it", "Tag it"] → {"q1": {"type": "choice", "instructions": "Option 1 of 2: Push it…
+    The other options: 2 (Tag it)…", "criteria": {"take it now": …, "later": …, "skip": …}}, …}
     """
+    count = len(options)
     out: dict[str, dict] = {}
     for index, option in enumerate(options):
+        others = ["%d (%s)" % (other + 1, options[other]) for other in range(count) if other != index]
+        lines = [
+            "Option %d of %d: %s" % (index + 1, count, option),
+            "The other options: %s" % ("; ".join(others) if others else "none"),
+            ANSWER_INSTRUCTIONS,
+        ]
+        if is_none_option(option):
+            lines.append(NONE_INSTRUCTIONS)
         out["q%d" % (index + 1)] = {
             "type": "choice",
-            "instructions": "Option: %s. %s" % (option, ANSWER_INSTRUCTIONS),
+            "instructions": "\n".join(lines),
             "criteria": dict(CRITERIA),
         }
     return out
@@ -90,35 +165,139 @@ def scored(answers: dict, count: int) -> list[tuple[float, int]]:
     return out
 
 
-def picks(answers: dict, count: int) -> list[int]:
+def _beats_the_alternatives(answers: dict, index: int) -> bool:
+    """Take-it-now has to beat 'later' and 'skip', not merely clear the bar.
+
+    A 0.51 beside a 0.49 skip is a coin toss dressed as a verdict, and marking it
+    picks a fight with the classifier's own second choice.
+    """
+    question = answers.get("q%d" % (index + 1))
+    now = _probabilities(question, TAKE_NOW)
+    if now is None:
+        return False
+    for label in (LATER, SKIP):
+        other = _probabilities(question, label)
+        if other is not None and other >= now:
+            return False
+    return True
+
+
+def _without_none_conflict(
+    keep: list[int], scores: dict[int, float], options: list[str], count: int
+) -> list[int]:
+    """A "take none of these" option is never recommended beside another option.
+
+    It is also only recommended when it is preferred over every other option: if any
+    action scores at least as high, the action is the answer and the none option is
+    dropped, because taking a step and taking no step cannot both be right.
+    """
+    none_indexes = [index for index in keep if is_none_option(options[index])]
+    if not none_indexes:
+        return keep
+    best_none = max(none_indexes, key=lambda index: (scores[index], -index))
+    actions = [index for index in range(count) if not is_none_option(options[index])]
+    if not actions:
+        return [best_none]
+    best_action = max((scores[index] for index in actions if index in scores), default=None)
+    if best_action is None or scores[best_none] > best_action:
+        return [best_none]
+    return [index for index in keep if index not in none_indexes]
+
+
+def _never_everything(keep: list[int], scores: dict[int, float], count: int) -> list[int]:
+    """Every option clearing the bar is not a recommendation: leave the weakest out.
+
+    Asking a person to do all of it says the reply offered no real choice, and with
+    two options it reduces to "do both of these".
+    """
+    if count < 2 or len(keep) < count:
+        return keep
+    weakest = min(keep, key=lambda index: (scores[index], -index))
+    return [index for index in keep if index != weakest]
+
+
+def picks(answers: dict, count: int, options: list[str] | None = None) -> list[int]:
     """The indexes to recommend, ascending, at most MAX_RECOMMENDED.
 
-    Three options at 0.81 / 0.79 / 0.77 → [0, 1, 2];  an 0.91 favourite over 0.04s → [0];
-    nothing at or above 0.5 → [].
+    Options are needed for the "none of the above" rule, because it is the wording
+    that says what an option means. Without them the arithmetic still applies.
+
+    Three options at 0.81 / 0.79 / 0.77 → the strongest two, because recommending all
+    three is not a recommendation. An 0.91 favourite over 0.04s → [0]. Nothing at or
+    above 0.5 → [].
     """
     if not isinstance(answers, dict) or count <= 0:
         return []
-    keep = [index for probability, index in scored(answers, count) if probability >= MIN_TAKE_NOW]
+    scores = {index: probability for probability, index in scored(answers, count)}
+    keep = [
+        index
+        for index in range(count)
+        if scores.get(index) is not None
+        and scores[index] >= MIN_TAKE_NOW
+        and _beats_the_alternatives(answers, index)
+    ]
+    if options:
+        keep = _without_none_conflict(keep, scores, options, count)
+    keep = _never_everything(keep, scores, count)
+    keep.sort(key=lambda index: (-scores[index], index))
     return sorted(keep[:MAX_RECOMMENDED])
+
+
+def _notes(options: list[str], answers: dict, recommended: list[int]) -> list[str]:
+    """One line per rule that changed the answer, so the model can see why."""
+    count = len(options)
+    scores = {index: probability for probability, index in scored(answers, count)}
+    notes: list[str] = []
+    kept_none = [index for index in recommended if is_none_option(options[index])]
+    if kept_none:
+        notes.append(
+            "Option %s means taking none of these and is preferred over every other option, so "
+            "it is marked alone." % ", ".join(str(index + 1) for index in kept_none)
+        )
+    dropped_none = [
+        index
+        for index in range(count)
+        if is_none_option(options[index])
+        and index not in recommended
+        and scores.get(index, 0) >= MIN_TAKE_NOW
+    ]
+    if dropped_none:
+        notes.append(
+            "Option %s means taking none of these, and an action is preferred, so it stays out."
+            % ", ".join(str(index + 1) for index in dropped_none)
+        )
+    if count >= 2 and len(scores) == count and all(s >= MIN_TAKE_NOW for s in scores.values()):
+        if len(recommended) < count:
+            notes.append(
+                "Every option cleared the bar, so the weakest is left out: recommending all of "
+                "them is not a recommendation."
+            )
+    return notes
 
 
 def reply(options: list[str], answers: dict) -> str:
     """What the model reads: the attribute to write, or why there is none."""
     count = len(options)
-    recommended = picks(answers, count)
+    recommended = picks(answers, count, options)
     if not recommended:
-        return (
-            'No option reached %.2f on take-it-now, so leave rec out of the directive.' % MIN_TAKE_NOW
-        )
+        text = "No option reached %.2f on take-it-now, so leave rec out of the directive." % MIN_TAKE_NOW
+        best = scored(answers, count)
+        if best:
+            # Say how close it was: a model told "1 was 0.42" can offer different
+            # options next time, where a bare refusal teaches it nothing.
+            text += " The highest was %d at %.2f." % (best[0][1] + 1, best[0][0])
+        return text
     by_index = {index: probability for probability, index in scored(answers, count)}
     numbers = ",".join(str(index + 1) for index in recommended)
     detail = ", ".join("%d (%.2f)" % (index + 1, by_index[index]) for index in recommended)
-    return 'Recommended %d of %d: %s. Write rec="%s" into the directive.' % (
+    text = 'Recommended %d of %d: %s. Write rec="%s" into the directive.' % (
         len(recommended),
         count,
         detail,
         numbers,
     )
+    notes = _notes(options, answers, recommended)
+    return text + " " + " ".join(notes) if notes else text
 
 
 def _answers_from(result: object) -> dict | None:
@@ -147,7 +326,7 @@ def recommend(dispatch, options: list[str], context: str = "") -> str:
         return "A recommendation needs at least two options; leave rec out."
     clean = clean[:MAX_OPTIONS]
     args = {
-        "state": (str(context or "").strip() or DEFAULT_STATE),
+        "state": state_for(clean, context),
         "questions": questions(clean),
     }
     for name in RANKERS:
@@ -168,10 +347,11 @@ FOLLOWUP_RECOMMEND_SCHEMA = {
     "description": (
         "Ask the decision classifier which of the next steps you are about to offer are worth "
         "taking now, for the rec attribute of a ::followups directive. Returns the 1-based option "
-        "numbers at or above the threshold, which can be more than one when several steps belong "
-        "together. Call it before writing the directive when the chips are a real choice, then write "
-        'rec="<numbers>" into it exactly as returned. If it reports no classifier, write the '
-        "directive without rec."
+        "numbers that cleared the threshold, which can be more than one when several steps belong "
+        "together. It never marks two alternatives at once, never marks a 'none of these' option "
+        "beside an action, and never marks every option. Call it before writing the directive when "
+        'the chips are a real choice, then write rec="<numbers>" into it exactly as returned; if '
+        "it says nothing cleared, leave rec out."
     ),
     "parameters": {
         "type": "object",

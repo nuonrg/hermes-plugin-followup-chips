@@ -2,6 +2,10 @@
 // The agent ends a reply with a paragraph alone on its own line:
 //   ::followups{q1="..." q2="..." q3="..."}
 // Each qN renders as a chip; click sends it as the next user turn.
+// Add multi="1" to let several chips be picked and sent as one turn:
+//   ::followups{multi="1" q1="..." q2="..." q3="..."}
+// Add rec="1,3" (1-based q numbers) to mark the options a ranker put first:
+// those chips carry a Recommended tag and start out picked.
 import { TRANSCRIPT_DIRECTIVE_AREA, host } from '@hermes/plugin-sdk'
 import { useState, useEffect } from 'react'
 import { jsx } from 'react/jsx-runtime'
@@ -37,7 +41,10 @@ function ensureArcStyle() {
 
 /* Per-session chip state: which chip was chosen, and whether the agent is still
    answering that session (arc keeps running until message.complete). Backed by
-   ctx.storage so choices survive window reloads. */
+   ctx.storage so choices survive window reloads.
+   `chosen` is the single-select index (null when nothing was sent); `picked` is
+   the multi-select list of indexes; `sent` records that a block's picks were
+   submitted as one turn. */
 const groups = new Map()
 
 let storage = null /* bound in register */
@@ -56,7 +63,7 @@ function persistChoice(key, g) {
   if (!storage) return
   try {
     const all = storage.get('choices', {}) || {}
-    all[key] = { chosen: g.chosen }
+    all[key] = { chosen: g.chosen, picked: g.picked, sent: g.sent, touched: g.touched }
     storage.set('choices', all)
   } catch (e) {
     /* persistence is best-effort */
@@ -70,8 +77,18 @@ function hydrate() {
     if (all && typeof all === 'object') {
       Object.keys(all).forEach(function (key) {
         const v = all[key]
-        if (v && typeof v === 'object' && v.chosen != null) {
-          group(key).chosen = v.chosen
+        if (v && typeof v === 'object') {
+          const g = group(key)
+          /* A stored entry means this block has been used (or was seeded), so the
+             recommended defaults must never run over it again. */
+          g.touched = true
+          if (v.chosen != null) g.chosen = v.chosen
+          if (Array.isArray(v.picked)) {
+            g.picked = v.picked.filter(function (n) {
+              return typeof n === 'number' && n >= 0
+            })
+          }
+          if (v.sent === true) g.sent = true
         }
       })
     }
@@ -83,7 +100,7 @@ function hydrate() {
 function group(key) {
   let g = groups.get(key)
   if (!g) {
-    g = { chosen: null, running: false, listeners: new Set() }
+    g = { chosen: null, picked: [], sent: false, touched: false, running: false, listeners: new Set() }
     groups.set(key, g)
   }
   return g
@@ -107,31 +124,91 @@ function snapshot(key) {
   return g ? g.chosen : null
 }
 
+function pickedOf(key) {
+  const g = groups.get(key)
+  return g ? g.picked : []
+}
+
+function sentOf(key) {
+  const g = groups.get(key)
+  return g ? g.sent : false
+}
+
 function running(key) {
   const g = groups.get(key)
   return g ? g.running : false
+}
+
+/* Tri-state: true = pick several, false = one click sends, null = the caller decides.
+   `multi="0"` (or false/no/off) opts a block out of picking. */
+function isMulti(value) {
+  if (value === true) return true
+  if (value === false) return false
+  if (value == null) return null
+  const text = String(value).trim()
+  if (/^(0|false|no|off)$/i.test(text)) return false
+  if (/^(1|true|yes|on)$/i.test(text)) return true
+  return null
+}
+
+/* rec="1,3" → [0, 2]. 1-based so it lines up with the qN an agent writes; junk,
+   zero and out-of-range numbers are dropped instead of trusted. */
+function parseRec(value, count) {
+  if (value == null) return []
+  const raw = Array.isArray(value) ? value : String(value).split(/[\s,;]+/)
+  const out = []
+  raw.forEach(function (item) {
+    if (!/^\d+$/.test(String(item).trim())) return
+    const idx = parseInt(String(item).trim(), 10) - 1
+    if (idx >= 0 && idx < count && out.indexOf(idx) === -1) out.push(idx)
+  })
+  return out.sort(function (a, b) {
+    return a - b
+  })
+}
+
+const REC_MARK = {
+  fontSize: '0.85em',
+  fontWeight: 600,
+  letterSpacing: '0.03em',
+  textTransform: 'uppercase',
+  padding: '1px 7px',
+  borderRadius: '999px',
+  whiteSpace: 'nowrap',
+  lineHeight: 1.35,
 }
 
 function Chip(props) {
   const q = props.q
   const idx = props.idx
   const sessionKey = props.sessionKey
+  const multi = props.multi
+  const active = props.active
   const onSend = props.onSend
+  const onToggle = props.onToggle
   ensureArcStyle()
   const chosen = useGroupState(sessionKey)
-  const isChosen = chosen === idx
+  const picked = usePickedState(sessionKey)
+  const isChosen = !multi && chosen === idx
+  const isPicked = multi && picked.indexOf(idx) !== -1
   const isRunning = isChosen && runningState(sessionKey)
   const [hover, setHover] = useState(false)
   const primary = 'var(--dt-primary, var(--accent, var(--foreground)))'
+  const marked = isChosen || isPicked
+  /* In multi-select nothing is sent on a chip, so an unanswered block keeps
+     every chip at full strength; single-select dims the ones you passed over. */
+  const dimmed = multi ? !active : chosen != null && !isChosen
   const className =
-    'fu-chip' + (isChosen ? ' fu-chosen' : '') + (isRunning ? ' fu-running' : '')
+    'fu-chip' + (marked ? ' fu-chosen' : '') + (isRunning ? ' fu-running' : '')
   return jsx(
     'button',
     {
       type: 'button',
       className: className,
+      'aria-pressed': multi ? isPicked : undefined,
       onClick: function () {
-        onSend(q, idx)
+        if (multi) onToggle(idx)
+        else onSend(q, idx)
       },
       onMouseEnter: function () {
         setHover(true)
@@ -142,19 +219,22 @@ function Chip(props) {
       title: q,
       style: {
         cursor: 'pointer',
-        border: isChosen
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: '8px',
+        border: marked
           ? '1px solid color-mix(in srgb, ' + primary + ' 55%, transparent)'
           : hover
             ? '1px solid color-mix(in srgb, ' + primary + ' 55%, transparent)'
             : '1px solid var(--ui-stroke-secondary, var(--border))',
         borderRadius: '12px',
-        background: isChosen
+        background: marked
           ? 'color-mix(in srgb, ' + primary + ' 7%, transparent)'
           : hover
             ? 'color-mix(in srgb, ' + primary + ' 7%, transparent)'
             : 'transparent',
-        color: isChosen || hover ? primary : 'var(--ui-text-secondary, var(--foreground))',
-        opacity: isChosen ? 1 : chosen != null ? 0.72 : 1,
+        color: marked || hover ? primary : 'var(--ui-text-secondary, var(--foreground))',
+        opacity: dimmed ? 0.72 : 1,
         padding: '5px 12px',
         fontSize: '0.9em',
         textAlign: 'left',
@@ -164,11 +244,79 @@ function Chip(props) {
         transition: 'border-color 160ms ease, background 160ms ease, color 160ms ease, opacity 160ms ease',
       },
       children: [
-        (isChosen ? '✓ ' : '') + q,
+        jsx('span', { key: 'label', children: (marked ? '✓ ' : '') + q }),
+        props.recommended
+          ? jsx('span', {
+              key: 'rec',
+              style: Object.assign({}, REC_MARK, {
+                /* Darkened against the foreground so the small uppercase text clears
+                   4.5:1 on its own 10% fill (the raw accent measured 4.35:1). */
+                color: 'color-mix(in srgb, ' + primary + ' 76%, var(--foreground, #111) 24%)',
+                background: 'color-mix(in srgb, ' + primary + ' 10%, transparent)',
+              }),
+              children: 'Recommended',
+            })
+          : null,
         jsx('span', { key: 'arc', className: 'fu-arc', 'aria-hidden': 'true' }),
       ],
     },
     'chip' + idx
+  )
+}
+
+/* The only submit path in multi-select. It carries the arc while the agent
+   answers, so the block still shows which turn is in flight. */
+function Send(props) {
+  const sessionKey = props.sessionKey
+  const count = props.count
+  const sent = props.sent
+  const onSend = props.onSend
+  ensureArcStyle()
+  const isRunning = sent && runningState(sessionKey)
+  const [hover, setHover] = useState(false)
+  const primary = 'var(--dt-primary, var(--accent, var(--foreground)))'
+  const disabled = count === 0 || sent
+  const live = hover && !disabled
+  return jsx(
+    'button',
+    {
+      type: 'button',
+      className: 'fu-chip fu-send' + (isRunning ? ' fu-running' : ''),
+      disabled: disabled,
+      onClick: function () {
+        if (!disabled) onSend()
+      },
+      onMouseEnter: function () {
+        setHover(true)
+      },
+      onMouseLeave: function () {
+        setHover(false)
+      },
+      title: sent ? 'Sent' : count === 0 ? 'Pick one or more' : 'Send the picked steps as one message',
+      style: {
+        cursor: disabled ? 'default' : 'pointer',
+        border: '1px solid color-mix(in srgb, ' + primary + ' ' + (disabled ? '28%' : '55%') + ', transparent)',
+        borderRadius: '12px',
+        background: disabled
+          ? 'transparent'
+          : live
+            ? 'color-mix(in srgb, ' + primary + ' 16%, transparent)'
+            : 'color-mix(in srgb, ' + primary + ' 9%, transparent)',
+        color: disabled ? 'var(--ui-text-secondary, var(--foreground))' : primary,
+        opacity: disabled ? 0.55 : 1,
+        padding: '5px 14px',
+        marginTop: '2px',
+        fontSize: '0.9em',
+        fontWeight: 500,
+        lineHeight: 1.35,
+        transition: 'border-color 160ms ease, background 160ms ease, color 160ms ease, opacity 160ms ease',
+      },
+      children: [
+        sent ? '✓ Sent' : count === 0 ? 'Send' : 'Send ' + count,
+        jsx('span', { key: 'arc', className: 'fu-arc', 'aria-hidden': 'true' }),
+      ],
+    },
+    'send'
   )
 }
 
@@ -186,6 +334,11 @@ function useGroupState(key) {
     [key]
   )
   return snapshot(key)
+}
+
+function usePickedState(key) {
+  useGroupState(key)
+  return pickedOf(key)
 }
 
 function runningState(key) {
@@ -213,12 +366,30 @@ function Chips(props) {
     .filter(function (q) {
       return typeof q === 'string' && q.length > 0
     })
+  /* Two or more chips are pickable unless the directive says otherwise. A block
+     that defaulted to one-click-sends made picking two next steps send two turns
+     and queue them; multi="0" is the opt-out for genuinely exclusive options. */
+  const multi = isMulti(attrs.multi) !== false && qs.length > 1
   if (qs.length === 0) return null
+
+  const rec = parseRec(attrs.rec, qs.length)
+  /* Recommended options start picked, exactly once. A stored entry or any later
+     tick counts as touched, so a user who unticks them is never overruled by the
+     defaults coming back on the next render. */
+  const g = group(groupKey)
+  if (multi && rec.length && !g.touched && !g.sent) {
+    g.picked = rec.slice()
+    g.touched = true
+  }
+
+  const picked = usePickedState(groupKey)
+  const sent = sentOf(groupKey)
+  const active = multi ? !sent : snapshot(groupKey) == null
 
   function send(q, idx) {
     var submit = host && host.composer && host.composer.submit
-    var sent = typeof submit === 'function' ? submit(sessionId != null ? sessionId : null, q) : false
-    if (sent) {
+    var ok = typeof submit === 'function' ? submit(sessionId != null ? sessionId : null, q) : false
+    if (ok) {
       const g = group(groupKey)
       g.chosen = idx
       g.running = true
@@ -233,6 +404,70 @@ function Chips(props) {
     }
   }
 
+  /* One turn carries every picked chip, in q order, one per line: the agent
+     reads it as a person asking for several things at once. */
+  function sendPicked() {
+    const text = qs
+      .filter(function (q, i) {
+        return picked.indexOf(i) !== -1
+      })
+      .join('\n')
+    if (!text) return
+    var submit = host && host.composer && host.composer.submit
+    var ok = typeof submit === 'function' ? submit(sessionId != null ? sessionId : null, text) : false
+    if (ok) {
+      const g = group(groupKey)
+      g.sent = true
+      g.running = true
+      setActive(groupKey)
+      persistChoice(groupKey, g)
+      emit(groupKey)
+      groups.forEach(function (_, k) {
+        if (k !== groupKey) emit(k)
+      })
+    } else if (host && host.notify) {
+      host.notify({ kind: 'warning', message: 'Open that chat to continue' })
+    }
+  }
+
+  function toggle(idx) {
+    const g = group(groupKey)
+    if (g.sent) return
+    if (g.picked.indexOf(idx) === -1) {
+      g.picked = g.picked.concat([idx]).sort(function (a, b) { return a - b })
+    } else {
+      g.picked = g.picked.filter(function (n) { return n !== idx })
+    }
+    persistChoice(groupKey, g)
+    emit(groupKey)
+  }
+
+  const rows = qs.map(function (q, i) {
+    return jsx(Chip, {
+      key: String(i) + ':' + q,
+      q: q,
+      idx: i,
+      multi: multi,
+      active: active,
+      recommended: rec.indexOf(i) !== -1,
+      sessionKey: groupKey,
+      onSend: send,
+      onToggle: toggle,
+    })
+  })
+
+  if (multi) {
+    rows.push(
+      jsx(Send, {
+        key: 'send',
+        sessionKey: groupKey,
+        count: picked.length,
+        sent: sent,
+        onSend: sendPicked,
+      })
+    )
+  }
+
   return jsx('div', {
     style: {
       display: 'flex',
@@ -241,15 +476,7 @@ function Chips(props) {
       gap: '6px',
       margin: '6px 0 2px 0',
     },
-    children: qs.map(function (q, i) {
-      return jsx(Chip, {
-        key: String(i) + ':' + q,
-        q: q,
-        idx: i,
-        sessionKey: groupKey,
-        onSend: send,
-      })
-    }),
+    children: rows,
   })
 }
 

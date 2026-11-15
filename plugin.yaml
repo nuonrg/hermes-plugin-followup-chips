@@ -1,13 +1,28 @@
 name: followup-chips
 label: Follow-up Chips
-version: 1.0.0
+version: 1.0.1
 author: nuonrg
 homepage: https://github.com/nuonrg/hermes-plugin-followup-chips
 description: >
-  Clickable follow-up question chips under Hermes Desktop chat replies. The
-  agent ends a reply with a ::followups directive; each question renders as a
-  chip and one click sends it as the next user turn. Hermes arc-border hover,
-  the arc keeps running while the agent answers and rests on a checkmark when
-  done. Per-block choice state persists across reloads; every new block starts
-  blank. Desktop-only (desktop/plugin.js); no agent tools, hooks or env vars.
+  Clickable follow-up chips under Hermes Desktop chat replies. The agent ends a
+  reply with a ::followups directive; each option renders as a chip and one click
+  sends it as the next user turn. With multi="1" several chips can be ticked and
+  sent as one message, and the bundled prompt rule makes the agent end a choice
+  that way instead of asking "say the word and I'll...". An optional auto_offers
+  hook converts an offer the model wrote in prose anyway into the same chips
+  before the reply is stored. Hermes arc-border hover, the arc keeps running
+  while the agent answers and rests on a checkmark when done. Per-block state
+  persists across reloads; every new block starts blank.
 tags: [desktop, ux, chat]
+provides_hooks: [transform_llm_output]
+config_schema:
+  auto_offers:
+    type: bool
+    default: false
+    label: Turn a written offer into chips
+    description: >
+      When the agent ends a reply with an offer in prose ("say the word and I'll
+      push it", "want me to run the tests?"), rewrite that closing paragraph into
+      follow-up chips. Off by default: the bundled prompt rule already asks the
+      agent to end a choice with the directive, and this covers the replies that
+      ignore it.

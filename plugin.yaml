@@ -1,6 +1,6 @@
 name: followup-chips
 label: Follow-up Chips
-version: 1.0.3
+version: 1.0.4
 author: nuonrg
 homepage: https://github.com/nuonrg/hermes-plugin-followup-chips
 description: >
@@ -16,8 +16,10 @@ description: >
   and are simply never marked. Every chip in a block shares one width, set
   by the longest option, so a row of short actions still reads as a column. An
   optional auto_offers hook converts an offer the model wrote in prose anyway into
-  the same chips before the reply is stored. Hermes arc-border hover, the arc keeps
-  running while the agent answers and rests on a checkmark when done. Per-block
+  the same chips before the reply is stored. With carry_over on, a reply also shows
+  the proposals earlier replies left unanswered, each labelled with how many replies
+  back it was offered and an X to drop it, so a long queued session cannot bury them. Hermes arc-border hover, the arc
+  keeps running while the agent answers and rests on a checkmark when done. Per-block
   state persists across reloads; every new block starts blank.
 tags: [desktop, ux, chat]
 provides_tools: [followup_recommend]
@@ -54,3 +56,20 @@ config_schema:
       dark. Turn it off and every chip stays on the neutral surface until you pick
       it; the Recommended tag stays either way. This one reaches the chips by
       attribute (accent="0"), because renderer code cannot read plugin settings.
+  carry_over:
+    type: bool
+    default: false
+    label: Carry Over Old Proposals
+    description: >
+      A reply's chips are only reachable while they are on screen. In a long queued
+      session the next reply buries them, and a proposal you never answered is gone.
+      With this on, every reply also shows the proposals earlier replies left
+      unanswered, each labelled with how many replies back it was offered, and each
+      carries an X to drop it from the queue. Clicking the label scrolls back to the
+      reply that made the proposal. Reply 1 offers three steps, reply 2 offers none but still shows those
+      three, reply 3 offers two and shows five: its own two, then the three stale
+      ones. Picking a chip or pressing its X retires it. Off by default, because it
+      changes every reply: with it on the agent half also appends one empty
+      ::followups block to replies that propose nothing, since that slot is the only
+      place the chips can draw. Peeking at a chip you narrow down is the point; it
+      never sends anything on its own, so nothing is answered for you.

@@ -257,6 +257,37 @@ def stamp_accent(text: str, value: str = "0") -> str:
         return text
 
 
+def stamp_carry(text: str, platform: str = "") -> str:
+    """Mark the reply's chips as carry-over, or add one empty block where there is none.
+
+    The renderer cannot read plugin settings, so the agent half decides and stamps
+    the attribute. Two shapes matter:
+
+    - a reply that proposes something keeps its own chips and gets ``carry="1"``, so
+      the block also draws whatever earlier replies left unanswered;
+    - a reply that proposes nothing gets one empty block, because the directive slot
+      is the only place a desktop plugin can draw. That empty block is what lets a
+      chip-less response 2 still show the three proposals response 1 left alone.
+
+    Desktop only: on another surface the directive line would arrive as raw text.
+    Idempotent, and it never touches prose beyond appending that one line.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if str(platform or "").strip().lower() not in DRAWS:
+        return text
+    try:
+        if DIRECTIVE_RE.search(text):
+            if re.search(r"\bcarry\s*=", text):
+                return text
+            return _DIRECTIVE_BODY_RE.sub(
+                lambda m: m.group(1) + 'carry="1" ' + m.group(2) + m.group(3), text, count=1
+            )
+        return text.rstrip() + '\n\n::followups{carry="1"}'
+    except Exception:  # a hook must never break a reply
+        return text
+
+
 def rewrite(text: str, platform: str = "") -> str | None:
     """The hint's own hook: the reply with its closing offer drawn as chips.
 

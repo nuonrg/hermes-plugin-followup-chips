@@ -45,15 +45,32 @@ pkg('react', {
   }),
   'index.js': [
     'const states = new Map()',
+    'const effectDeps = new Map()',
+    'const cleanups = []',
     'let cursor = 0',
-    'export function __reset() { cursor = 0; states.clear() }',
+    'let effectCursor = 0',
+    'export function __reset() {',
+    '  cursor = 0',
+    '  effectCursor = 0',
+    '  states.clear()',
+    '  effectDeps.clear()',
+    '  while (cleanups.length) { const c = cleanups.pop(); try { c() } catch (e) {} }',
+    '}',
     'export function useState(initial) {',
     '  const slot = cursor++',
     '  if (!states.has(slot)) states.set(slot, typeof initial === "function" ? initial() : initial)',
     '  const set = (next) => { states.set(slot, typeof next === "function" ? next(states.get(slot)) : next) }',
     '  return [states.get(slot), set]',
     '}',
-    'export function useEffect() {}',
+    '// Effects run on the spot, honouring deps the way React would on a mount.',
+    'export function useEffect(fn, deps) {',
+    '  const slot = effectCursor++',
+    '  const key = deps ? JSON.stringify(deps) : null',
+    '  if (deps && effectDeps.get(slot) === key) return',
+    '  effectDeps.set(slot, key)',
+    '  const cleanup = fn()',
+    '  if (typeof cleanup === "function") cleanups.push(cleanup)',
+    '}',
   ].join('\n'),
   'jsx-runtime.js': [
     'export function jsx(type, props, key) { return { type, props: props || {}, key } }',
@@ -401,6 +418,190 @@ test('the row is one grid column sized to the widest chip, with Send outside it'
     assert.equal(chip.props.style.boxSizing, 'border-box')
   }
   assert.equal(send(el).props.style.justifySelf, 'start', 'Send keeps its own width')
+})
+
+/* ---- carry over: unanswered proposals follow their session --------------- */
+function freshChips(el) {
+  return roots(el).filter(
+    (c) =>
+      c &&
+      c.props &&
+      typeof c.props.className === 'string' &&
+      c.props.className.indexOf('fu-stale-row') === -1 &&
+      c.props.className.indexOf('fu-send') === -1
+  )
+}
+
+function staleRows(el) {
+  return roots(el).filter((c) => c && c.props && c.props.className === 'fu-stale-row')
+}
+
+function staleButton(row) {
+  return row.props.children[0]
+}
+
+function staleDismiss(row) {
+  return row.props.children[1]
+}
+
+function staleLabels(el) {
+  return staleRows(el).map((row) => label(staleButton(row)))
+}
+
+/* The age badge: "2 responses ago", and a jump button in its own right. */
+function ageBadge(row) {
+  return staleButton(row).props.children.find(
+    (c) => c && typeof c === 'object' && c.props && c.props.className === 'fu-age'
+  )
+}
+
+function ageText(row) {
+  return ageBadge(row).props.children
+}
+
+test('carry: a reply that proposes nothing still shows the unanswered chips', () => {
+  const s = 'carry-none'
+  render(register({ attrs: { carry: '1', q1: 'Push it', q2: 'Tag it', q3: 'Write notes' }, sessionId: s, source: 'r1' }))
+  const el = render(register({ attrs: { carry: '1' }, sessionId: s, source: 'r2' }))
+  assert.deepEqual(staleLabels(el), ['Push it', 'Tag it', 'Write notes'])
+  assert.ok(staleRows(el).every((row) => ageBadge(row)), 'every carried chip says how old it is')
+  assert.deepEqual(staleRows(el).map(ageText), ['1 response ago', '1 response ago', '1 response ago'])
+  assert.equal(freshChips(el).length, 0, 'this reply proposed nothing of its own')
+})
+
+test('carry: the newest reply shows its own chips first, then the older ones', () => {
+  const s = 'carry-mix'
+  render(register({ attrs: { carry: '1', q1: 'Push the branch', q2: 'Tag a release', q3: 'Write the notes' }, sessionId: s, source: 'm1' }))
+  render(register({ attrs: { carry: '1' }, sessionId: s, source: 'm2' }))
+  const el = render(register({ attrs: { carry: '1', q1: 'Add a test', q2: 'Update the docs' }, sessionId: s, source: 'm3' }))
+  assert.deepEqual(freshChips(el).map(label), ['Add a test', 'Update the docs'])
+  assert.deepEqual(staleLabels(el), ['Push the branch', 'Tag a release', 'Write the notes'])
+  assert.equal(freshChips(el).length + staleRows(el).length, 5, 'two new plus three stale')
+})
+
+test('carry: a carried chip sends exactly itself', () => {
+  const s = 'carry-click'
+  render(register({ attrs: { carry: '1', multi: '1', q1: 'A', q2: 'B' }, sessionId: s, source: 'k1' }))
+  const el = render(register({ attrs: { carry: '1', multi: '1', q1: 'C' }, sessionId: s, source: 'k2' }))
+  submits.length = 0
+  staleButton(staleRows(el)[0]).props.onClick()
+  assert.deepEqual(submits, [[s, 'A']])
+})
+
+test('carry: the X retires a proposal and a reload does not bring it back', () => {
+  const s = 'carry-x'
+  render(register({ attrs: { carry: '1', q1: 'A', q2: 'B' }, sessionId: s, source: 'x1' }))
+  const el = render(register({ attrs: { carry: '1' }, sessionId: s, source: 'x2' }))
+  staleDismiss(staleRows(el)[0]).props.onClick()
+  const after = render(register({ attrs: { carry: '1' }, sessionId: s, source: 'x3' }))
+  assert.deepEqual(staleLabels(after), ['B'], 'the dismissed one is gone')
+  /* A reload re-mounts the original reply, which re-registers its own chips.
+     The tombstone is what stops the dismissed chip coming back. */
+  render(register({ attrs: { carry: '1', q1: 'A', q2: 'B' }, sessionId: s, source: 'x1' }))
+  const reloaded = render(register({ attrs: { carry: '1' }, sessionId: s, source: 'x4' }))
+  assert.deepEqual(staleLabels(reloaded), ['B'], 're-registering does not resurrect it')
+})
+
+test('carry: answering a block retires its own proposals', () => {
+  const s = 'carry-answer'
+  const first = render(register({ attrs: { carry: '1', q1: 'A', q2: 'B' }, sessionId: s, source: 'a1' }))
+  freshChips(first)[0].props.onClick()
+  /* Nothing is carried any more, so the next reply draws no chips line at all. */
+  const next = render(register({ attrs: { carry: '1' }, sessionId: s, source: 'a2' }))
+  assert.equal(next, null, 'an answered reply is not carried')
+})
+
+test('carry: a block without the attribute ignores the queue', () => {
+  const s = 'carry-off'
+  render(register({ attrs: { carry: '1', q1: 'A' }, sessionId: s, source: 'o1' }))
+  const el = render(register({ attrs: { q1: 'B' }, sessionId: s, source: 'o2' }))
+  assert.equal(staleRows(el).length, 0)
+})
+
+test('carry: an empty queue draws no block at all', () => {
+  const el = render(register({ attrs: { carry: '1' }, sessionId: 'carry-empty', source: 'e1' }))
+  assert.equal(el, null, 'nothing to carry and nothing proposed means no chips line')
+})
+
+test('carry: proposals stay inside their own session', () => {
+  render(register({ attrs: { carry: '1', q1: 'A' }, sessionId: 'carry-sess-a', source: 'p1' }))
+  const other = render(register({ attrs: { carry: '1' }, sessionId: 'carry-sess-b', source: 'p2' }))
+  assert.equal(other, null)
+})
+
+test('carry: the queue is capped so a long session cannot grow without bound', () => {
+  const s = 'carry-cap'
+  const many = { carry: '1' }
+  for (let i = 1; i <= 33; i += 1) many['q' + i] = 'Option ' + i
+  render(register({ attrs: many, sessionId: s, source: 'cap1' }))
+  const el = render(register({ attrs: { carry: '1' }, sessionId: s, source: 'cap2' }))
+  assert.equal(staleRows(el).length, 30, 'keeps the newest 30')
+  assert.equal(label(staleButton(staleRows(el)[0])), 'Option 4', 'the oldest four were retired')
+})
+
+
+test('carry: the badge counts replies, not chips', () => {
+  const s = 'carry-age'
+  render(register({ attrs: { carry: '1', q1: 'A', q2: 'B' }, sessionId: s, source: 'g1' }))
+  const second = render(register({ attrs: { carry: '1' }, sessionId: s, source: 'g2' }))
+  assert.deepEqual(staleRows(second).map(ageText), ['1 response ago', '1 response ago'])
+  const third = render(register({ attrs: { carry: '1', q1: 'C' }, sessionId: s, source: 'g3' }))
+  assert.deepEqual(staleRows(third).map(ageText), ['2 responses ago', '2 responses ago'])
+})
+
+test('carry: the age badge jumps to the offering reply and sends nothing', () => {
+  const s = 'carry-jump'
+  const first = render(register({ attrs: { carry: '1', q1: 'A' }, sessionId: s, source: 'j1' }))
+  const originId = first.props.id
+  assert.ok(/^fu-block-[a-z0-9]+-1$/.test(originId || ''), 'the offering block has a stable address')
+  const el = render(register({ attrs: { carry: '1', q1: 'B' }, sessionId: s, source: 'j2' }))
+  assert.notEqual(el.props.id, originId, 'each reply has its own address')
+  const row = staleRows(el)[0]
+  const badge = ageBadge(row)
+  assert.equal(ageText(row), '1 response ago')
+
+  const jumps = []
+  globalThis.document = {
+    getElementById: (id) => (id === originId ? { scrollIntoView: (opts) => jumps.push(opts) } : null),
+    createElement: () => ({ id: '', textContent: '' }),
+    head: { appendChild: () => {} },
+  }
+  submits.length = 0
+  let stopped = false
+  badge.props.onClick({ stopPropagation: () => { stopped = true } })
+  delete globalThis.document
+
+  assert.equal(stopped, true, 'the badge click never reaches the pill')
+  assert.equal(submits.length, 0, 'jumping is not sending')
+  assert.equal(jumps.length, 1, 'it scrolls the offering reply into view')
+  assert.equal(jumps[0].block, 'center')
+})
+
+test('carry: a missing offering reply notifies instead of throwing', () => {
+  const s = 'carry-gone'
+  render(register({ attrs: { carry: '1', q1: 'A' }, sessionId: s, source: 'z1' }))
+  const el = render(register({ attrs: { carry: '1', q1: 'B' }, sessionId: s, source: 'z2' }))
+  globalThis.document = { getElementById: () => null, createElement: () => ({ id: '', textContent: '' }), head: { appendChild: () => {} } }
+  submits.length = 0
+  ageBadge(staleRows(el)[0]).props.onClick({ stopPropagation: () => {} })
+  delete globalThis.document
+  assert.equal(submits.length, 1)
+  assert.equal(submits[0][0], 'notify')
+})
+
+test('carry: pressing the pill with the keyboard sends it, Enter and Space alike', () => {
+  const s = 'carry-keys'
+  render(register({ attrs: { carry: '1', q1: 'A' }, sessionId: s, source: 'y1' }))
+  const el = render(register({ attrs: { carry: '1', q1: 'B' }, sessionId: s, source: 'y2' }))
+  const pill = staleButton(staleRows(el)[0])
+  assert.equal(pill.props.role, 'button')
+  assert.equal(pill.props.tabIndex, 0)
+  submits.length = 0
+  let prevented = 0
+  pill.props.onKeyDown({ key: 'Enter', preventDefault: () => { prevented += 1 } })
+  pill.props.onKeyDown({ key: ' ', preventDefault: () => { prevented += 1 } })
+  assert.deepEqual(submits, [[s, 'A'], [s, 'A']])
+  assert.equal(prevented, 2, 'space must not also scroll the transcript')
 })
 
 /* ---- report ------------------------------------------------------------- */

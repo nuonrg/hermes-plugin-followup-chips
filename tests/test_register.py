@@ -221,5 +221,49 @@ class RecommendRegistrationTest(unittest.TestCase):
                 self.assertNotIn("nerve", line)
 
 
+    def test_carry_over_marks_the_reply_and_adds_a_block_when_it_has_none(self):
+        ctx = FakeCtx({"carry_over": True})
+        plugin.register(ctx)
+        hook = ctx.hooks["transform_llm_output"]
+        self.assertEqual(
+            hook(response_text='::followups{q1="A"}', platform="local"),
+            '::followups{carry="1" q1="A"}',
+        )
+        self.assertEqual(
+            hook(response_text="Nothing to offer.", platform="local"),
+            'Nothing to offer.\n\n::followups{carry="1"}',
+        )
+
+    def test_carry_over_is_off_by_default(self):
+        ctx = FakeCtx()
+        plugin.register(ctx)
+        hook = ctx.hooks["transform_llm_output"]
+        self.assertIsNone(hook(response_text="Nothing to offer.", platform="local"))
+
+    def test_carry_over_never_reaches_another_surface(self):
+        ctx = FakeCtx({"carry_over": True})
+        plugin.register(ctx)
+        hook = ctx.hooks["transform_llm_output"]
+        self.assertIsNone(hook(response_text="Nothing to offer.", platform="telegram"))
+
+    def test_carry_and_offer_conversion_compose(self):
+        # The converted directive is the one that gets marked, so reply 1 in a
+        # queued session carries over too.
+        ctx = FakeCtx({"carry_over": True, "auto_offers": True})
+        plugin.register(ctx)
+        hook = ctx.hooks["transform_llm_output"]
+        out = hook(response_text=OFFER, platform="local")
+        self.assertEqual(out, 'Branch is pushed.\n\n::followups{carry="1" q1="Open the PR"}')
+
+    def test_carry_over_also_ships_with_the_accent_off(self):
+        # Two independent jobs on one hook: turning the accent off must not stop
+        # the carry stamp, and the accent stamp must survive it.
+        ctx = FakeCtx({"carry_over": True, "accent_recommended": False})
+        plugin.register(ctx)
+        out = ctx.hooks["transform_llm_output"](response_text='::followups{rec="1" q1="A"}', platform="local")
+        self.assertIn('accent="0"', out)
+        self.assertIn('carry="1"', out)
+
+
 if __name__ == "__main__":
     unittest.main()

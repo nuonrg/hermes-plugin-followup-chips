@@ -124,6 +124,234 @@ function snapshot(key) {
   return g ? g.chosen : null
 }
 
+/* Carried proposals: options an earlier reply offered and nobody answered.
+   Per session in ctx.storage as
+   { v: 2, next, blocks: { blockKey: n }, entries: [{ id, key, i, label, n, gone }] }
+   `n` numbers the replies: every carry block takes the next number the first time
+   it mounts, so "2 responses ago" is arithmetic rather than a guess, and it
+   survives a reload because the numbers are stored.
+   `gone` is a tombstone rather than a delete, because every block re-registers its
+   own chips when it mounts and a reload would otherwise resurrect a chip the user
+   dismissed. */
+const CARRY_STORAGE = 'carried'
+const CARRY_VERSION = 2
+const CARRY_LIMIT = 30
+const carryStates = new Map()
+const carryListeners = new Map()
+
+function carryListenersFor(sessionId) {
+  let set = carryListeners.get(sessionId)
+  if (!set) {
+    set = new Set()
+    carryListeners.set(sessionId, set)
+  }
+  return set
+}
+
+function subscribeCarry(sessionId, fn) {
+  const set = carryListenersFor(sessionId)
+  set.add(fn)
+  return function () {
+    set.delete(fn)
+  }
+}
+
+function emitCarry(sessionId) {
+  carryListenersFor(sessionId).forEach(function (fn) {
+    fn()
+  })
+}
+
+function emptyCarryState() {
+  return { v: CARRY_VERSION, next: 1, blocks: {}, entries: [] }
+}
+
+/* Cap the log so a long session cannot grow storage without bound: tombstones go
+   first, then the oldest live entries. The reply numbers stay in `blocks`, so a
+   trimmed reply still counts in "responses ago". */
+function trimCarry(state) {
+  if (state.entries.length <= CARRY_LIMIT) return state
+  const out = state.entries.slice()
+  while (out.length > CARRY_LIMIT) {
+    let idx = -1
+    for (let i = 0; i < out.length; i += 1) {
+      if (out[i].gone) {
+        idx = i
+        break
+      }
+    }
+    out.splice(idx === -1 ? 0 : idx, 1)
+  }
+  state.entries = out
+  return state
+}
+
+/* 1.0.4 stored a bare array with no reply numbers. Give each block the number of
+   the first entry that came from it, in log order, so an upgrade keeps its queue
+   and starts counting from there. */
+function migrateCarry(raw) {
+  const state = emptyCarryState()
+  if (Array.isArray(raw)) {
+    raw.forEach(function (entry) {
+      if (!entry || typeof entry.id !== 'string' || typeof entry.label !== 'string') return
+      let n = state.blocks[entry.key]
+      if (n == null) {
+        n = state.next
+        state.next += 1
+        state.blocks[entry.key] = n
+      }
+      state.entries.push({
+        id: entry.id,
+        key: entry.key,
+        i: entry.i,
+        label: entry.label,
+        n: n,
+        gone: entry.gone === true,
+      })
+    })
+    return trimCarry(state)
+  }
+  if (raw && typeof raw === 'object') {
+    if (raw.blocks && typeof raw.blocks === 'object') state.blocks = Object.assign({}, raw.blocks)
+    if (typeof raw.next === 'number' && raw.next > 0) state.next = raw.next
+    if (Array.isArray(raw.entries)) {
+      state.entries = raw.entries.filter(function (e) {
+        return e && typeof e.id === 'string' && typeof e.label === 'string'
+      })
+    }
+    return state
+  }
+  return state
+}
+
+function carryState(sessionId) {
+  if (carryStates.has(sessionId)) return carryStates.get(sessionId)
+  let state = emptyCarryState()
+  if (storage) {
+    try {
+      const all = storage.get(CARRY_STORAGE, null)
+      const raw = all && typeof all === 'object' ? all[sessionId] : null
+      state = migrateCarry(raw)
+    } catch (e) {
+      state = emptyCarryState()
+    }
+  }
+  carryStates.set(sessionId, state)
+  return state
+}
+
+function persistCarry(sessionId, state) {
+  carryStates.set(sessionId, state)
+  if (storage) {
+    try {
+      const all = storage.get(CARRY_STORAGE, {}) || {}
+      all[sessionId] = state
+      storage.set(CARRY_STORAGE, all)
+    } catch (e) {
+      /* persistence is best-effort */
+    }
+  }
+  emitCarry(sessionId)
+}
+
+/* This block's reply number: assigned on first sight, kept on every later mount,
+   so the same reply keeps the same number across reloads. */
+function carrySequence(sessionId, blockKey) {
+  const state = carryState(sessionId)
+  let n = state.blocks[blockKey]
+  if (n == null) {
+    n = state.next
+    state.next += 1
+    state.blocks[blockKey] = n
+    persistCarry(sessionId, state)
+  }
+  return n
+}
+
+function registerProposals(sessionId, blockKey, labels, n) {
+  const state = carryState(sessionId)
+  const entries = state.entries.slice()
+  let changed = false
+  labels.forEach(function (label, i) {
+    const id = blockKey + '#' + i
+    const seen = entries.some(function (e) {
+      return e.id === id
+    })
+    if (!seen) {
+      entries.push({ id: id, key: blockKey, i: i, label: label, n: n, gone: false })
+      changed = true
+    }
+  })
+  if (changed) {
+    state.entries = entries
+    persistCarry(sessionId, trimCarry(state))
+  }
+}
+
+/* An answered block is not a proposal any more: the next reply must not list it. */
+function retireBlock(sessionId, blockKey) {
+  const state = carryState(sessionId)
+  let changed = false
+  state.entries = state.entries.map(function (e) {
+    if (e.key === blockKey && !e.gone) {
+      changed = true
+      return Object.assign({}, e, { gone: true })
+    }
+    return e
+  })
+  if (changed) persistCarry(sessionId, state)
+}
+
+function retireEntry(sessionId, id) {
+  const state = carryState(sessionId)
+  let changed = false
+  state.entries = state.entries.map(function (e) {
+    if (e.id === id && !e.gone) {
+      changed = true
+      return Object.assign({}, e, { gone: true })
+    }
+    return e
+  })
+  if (changed) persistCarry(sessionId, state)
+}
+
+/* What this block draws as carried: everything still unanswered that it did not
+   offer itself, oldest first, each with the number of the reply that offered it. */
+function staleFor(sessionId, blockKey) {
+  return carryState(sessionId).entries.filter(function (e) {
+    return !e.gone && e.key !== blockKey
+  })
+}
+
+/* A block's DOM id, so a carried chip can scroll back to where it was offered.
+   Session prefix plus reply number: stable across reloads, unique per block. */
+function blockDomId(sessionId, n) {
+  const text = String(sessionId || 'current')
+  let h = 5381
+  for (let i = 0; i < text.length; i += 1) {
+    h = ((h << 5) + h + text.charCodeAt(i)) | 0
+  }
+  return 'fu-block-' + (h >>> 0).toString(36) + '-' + n
+}
+
+function scrollToBlock(id) {
+  if (typeof document === 'undefined' || !document || typeof document.getElementById !== 'function') return false
+  const el = document.getElementById(id)
+  if (!el || typeof el.scrollIntoView !== 'function') return false
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  /* A smooth scroll can be dropped without animating (measured: inert in a
+     headless browser, where the instant call moved 1326px and the smooth one
+     moved nothing). If the page has not moved by the next frame, jump instead, so
+     the click always lands somewhere rather than silently doing nothing. */
+  if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+    const from = window.scrollY
+    window.requestAnimationFrame(function () {
+      if (Math.abs(window.scrollY - from) < 2) el.scrollIntoView({ block: 'center' })
+    })
+  }
+  return true
+}
+
 function pickedOf(key) {
   const g = groups.get(key)
   return g ? g.picked : []
@@ -141,6 +369,14 @@ function running(key) {
 
 /* `multi="1"`, `multi="true"` and a bare flag all mean multi-select. */
 function isMulti(value) {
+  if (value === true) return true
+  if (value == null) return false
+  return /^(1|true|yes|on)$/i.test(String(value).trim())
+}
+
+/* `carry="1"` (stamped by the agent half when Carry Over Old Proposals is on)
+   makes the block also draw earlier replies' unanswered chips, marked Stale. */
+function isCarry(value) {
   if (value === true) return true
   if (value == null) return false
   return /^(1|true|yes|on)$/i.test(String(value).trim())
@@ -180,6 +416,175 @@ const REC_MARK = {
   borderRadius: '999px',
   whiteSpace: 'nowrap',
   lineHeight: 1.35,
+}
+
+/* An unanswered option from an earlier reply. The pill sends it; the badge says
+   how many replies back it was offered and scrolls to that reply; the X drops it
+   without sending anything. Three jobs, three separate targets, so nothing sends
+   by accident: the badge and the X stop propagation, and the X is a sibling of
+   the pill rather than a child. */
+function StaleChip(props) {
+  const label = props.label
+  const back = props.back == null ? 1 : props.back
+  const onSend = props.onSend
+  const onDismiss = props.onDismiss
+  const onJump = props.onJump
+  ensureArcStyle()
+  const [hover, setHover] = useState(false)
+  const primary = 'var(--dt-primary, var(--accent, var(--foreground)))'
+  const stroke = hover ? 45 : 0
+  const age = back + (back === 1 ? ' response ago' : ' responses ago')
+  return jsx(
+    'div',
+    {
+      className: 'fu-stale-row',
+      style: { position: 'relative', display: 'flex', minWidth: 0 },
+      children: [
+        jsx(
+          'div',
+          {
+            key: 'send',
+            className: 'fu-chip fu-stale',
+            role: 'button',
+            tabIndex: 0,
+            title: label,
+            'aria-label': 'Send carried proposal: ' + label,
+            onClick: function () {
+              onSend()
+            },
+            onKeyDown: function (event) {
+              const key = event && (event.key || event.code)
+              if (key === 'Enter' || key === ' ' || key === 'Space') {
+                if (event.preventDefault) event.preventDefault()
+                onSend()
+              }
+            },
+            onMouseEnter: function () {
+              setHover(true)
+            },
+            onMouseLeave: function () {
+              setHover(false)
+            },
+            style: {
+              cursor: 'pointer',
+              flex: '1 1 auto',
+              width: '100%',
+              minWidth: 0,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              boxSizing: 'border-box',
+              border: stroke
+                ? '1px dashed color-mix(in srgb, ' + primary + ' ' + stroke + '%, transparent)'
+                : '1px dashed color-mix(in srgb, var(--ui-stroke-secondary, var(--border)) 85%, transparent)',
+              borderRadius: '12px',
+              background: 'transparent',
+              color: 'var(--ui-text-secondary, var(--foreground))',
+              /* Right padding holds the age badge and the X overlay, so neither
+                 takes width from the pill and every pill stays one width. */
+              padding: '5px 38px 5px 12px',
+              fontSize: '0.9em',
+              textAlign: 'left',
+              maxWidth: '100%',
+              lineHeight: 1.35,
+              transition: 'border-color 160ms ease, color 160ms ease',
+            },
+            children: [
+              jsx('span', {
+                key: 'label',
+                style: { display: 'inline-flex', alignItems: 'baseline', minWidth: 0 },
+                children: [
+                  /* Same reserved tick slot as a live pill, so a carried row lines
+                     up with the fresh chips above it instead of starting further left. */
+                  jsx('span', {
+                    key: 'tick',
+                    'aria-hidden': 'true',
+                    style: { visibility: 'hidden' },
+                    children: '✓ ',
+                  }),
+                  jsx('span', { key: 'q', children: label }),
+                ],
+              }),
+              jsx(
+                'button',
+                {
+                  key: 'age',
+                  type: 'button',
+                  className: 'fu-age',
+                  title: 'Offered ' + age + '. Jump to that reply.',
+                  'aria-label': 'Offered ' + age + '. Jump to that reply.',
+                  onClick: function (event) {
+                    if (event && event.stopPropagation) event.stopPropagation()
+                    onJump()
+                  },
+                  onKeyDown: function (event) {
+                    if (event && event.stopPropagation) event.stopPropagation()
+                  },
+                  style: {
+                    marginLeft: 'auto',
+                    flex: '0 0 auto',
+                    cursor: 'pointer',
+                    fontSize: '0.68em',
+                    fontWeight: 600,
+                    letterSpacing: '0.04em',
+                    textTransform: 'uppercase',
+                    padding: '1px 5px',
+                    borderRadius: '999px',
+                    border: '1px solid color-mix(in srgb, var(--ui-stroke-secondary, var(--border)) 80%, transparent)',
+                    background: 'transparent',
+                    color: 'var(--ui-text-secondary, var(--foreground))',
+                    whiteSpace: 'nowrap',
+                    lineHeight: 1.35,
+                    transition: 'color 160ms ease, border-color 160ms ease',
+                  },
+                  children: age,
+                },
+                'age'
+              ),
+              jsx('span', { key: 'arc', className: 'fu-arc', 'aria-hidden': 'true' }),
+            ],
+          },
+          'send'
+        ),
+        jsx(
+          'button',
+          {
+            key: 'dismiss',
+            type: 'button',
+            className: 'fu-chip-x',
+            title: 'Drop this carried proposal',
+            'aria-label': 'Drop carried proposal: ' + label,
+            onClick: function () {
+              onDismiss()
+            },
+            style: {
+              position: 'absolute',
+              right: '9px',
+              top: '50%',
+              transform: 'translateY(-50%)',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: '18px',
+              height: '18px',
+              cursor: 'pointer',
+              border: 'none',
+              borderRadius: '999px',
+              background: 'transparent',
+              color: 'var(--ui-text-secondary, var(--foreground))',
+              fontSize: '0.85em',
+              lineHeight: 1,
+              padding: 0,
+              transition: 'color 160ms ease, background 160ms ease',
+            },
+            children: '✕',
+          },
+          'dismiss'
+        ),
+      ],
+    },
+    'stale'
+  )
 }
 
 function Chip(props) {
@@ -402,7 +807,34 @@ function Chips(props) {
     .filter(function (q) {
       return typeof q === 'string' && q.length > 0
     })
-  if (qs.length === 0) return null
+  /* carry="1", stamped by the agent half when Carry Over Old Proposals is on:
+     the next reply buries the earlier chips, so this block also draws every
+     proposal still unanswered from the replies above it. */
+  const carryOn = isCarry(attrs.carry)
+  const carrySession = sessionId || 'current'
+  /* This reply's number in the session, so a carried chip can say how many
+     replies ago it was offered and scroll back to the one that offered it. */
+  const ourN = carryOn ? carrySequence(carrySession, groupKey) : 0
+  const [, bumpCarry] = useState(0)
+  useEffect(
+    function () {
+      if (!carryOn) return undefined
+      return subscribeCarry(carrySession, function () {
+        bumpCarry(function (n) {
+          return n + 1
+        })
+      })
+    },
+    [carryOn, carrySession]
+  )
+  const qsKey = qs.join('\n')
+  /* Register what this reply proposes, once, so later replies can carry it. */
+  useEffect(
+    function () {
+      if (carryOn && qs.length > 0) registerProposals(carrySession, groupKey, qs, ourN)
+    },
+    [carryOn, carrySession, groupKey, qsKey, ourN]
+  )
 
   const rec = parseRec(attrs.rec, qs.length)
   const accent = accentOn(attrs.accent)
@@ -416,6 +848,11 @@ function Chips(props) {
   }
 
   const picked = usePickedState(groupKey)
+  const stale = carryOn ? staleFor(carrySession, groupKey) : []
+  /* A reply that proposes nothing still has a block when carry is on, because
+     that is the only slot the stale chips can draw in. Nothing at all means no
+     chips and nothing to carry, and then no block is drawn. */
+  if (qs.length === 0 && stale.length === 0) return null
   const sent = sentOf(groupKey)
   const active = multi ? !sent : snapshot(groupKey) == null
 
@@ -428,6 +865,8 @@ function Chips(props) {
       g.running = true
       setActive(groupKey)
       persistChoice(groupKey, g)
+      /* Answered: this block's options stop being carried proposals. */
+      retireBlock(carrySession, groupKey)
       emit(groupKey)
       groups.forEach(function (_, k) {
         if (k !== groupKey) emit(k)
@@ -454,6 +893,7 @@ function Chips(props) {
       g.running = true
       setActive(groupKey)
       persistChoice(groupKey, g)
+      retireBlock(carrySession, groupKey)
       emit(groupKey)
       groups.forEach(function (_, k) {
         if (k !== groupKey) emit(k)
@@ -473,6 +913,23 @@ function Chips(props) {
     }
     persistChoice(groupKey, g)
     emit(groupKey)
+  }
+
+  /* A stale chip sends exactly itself: it belongs to an earlier reply, so it is
+     never part of this block's multi-select count. */
+  function sendStale(id, label) {
+    var submit = host && host.composer && host.composer.submit
+    var ok = typeof submit === 'function' ? submit(sessionId != null ? sessionId : null, label) : false
+    if (ok) {
+      retireEntry(carrySession, id)
+      setActive(groupKey)
+    } else if (host && host.notify) {
+      host.notify({ kind: 'warning', message: 'Open that chat to continue' })
+    }
+  }
+
+  function dismissStale(id) {
+    retireEntry(carrySession, id)
   }
 
   const rows = qs.map(function (q, i) {
@@ -502,7 +959,35 @@ function Chips(props) {
     )
   }
 
+  /* Older replies first, in the order they were offered: the newest reply shows
+     its own proposals, then everything still unanswered above it. Each carried
+     chip knows how many replies back it came from, and which block to scroll to. */
+  stale.forEach(function (entry) {
+    const back = Math.max(1, ourN - (typeof entry.n === 'number' ? entry.n : ourN - 1))
+    rows.push(
+      jsx(StaleChip, {
+        key: 'stale:' + entry.id,
+        label: entry.label,
+        back: back,
+        originId: blockDomId(carrySession, entry.n),
+        onSend: function () {
+          sendStale(entry.id, entry.label)
+        },
+        onDismiss: function () {
+          dismissStale(entry.id)
+        },
+        onJump: function () {
+          if (!scrollToBlock(blockDomId(carrySession, entry.n)) && host && host.notify) {
+            host.notify({ kind: 'warning', message: 'That reply is not on screen any more' })
+          }
+        },
+      })
+    )
+  })
+
   return jsx('div', {
+    /* A carried chip scrolls back here, so the block has to be findable. */
+    id: carryOn ? blockDomId(carrySession, ourN) : undefined,
     style: {
       /* One implicit column sized to the widest chip: every chip stretches to it,
          so all pills share a width and the narrowest option is not a stub. The

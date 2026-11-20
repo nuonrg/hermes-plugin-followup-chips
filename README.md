@@ -23,6 +23,7 @@ The plugin renders each `qN` as a clickable chip under the message. One click se
 - **Persistent** — choices survive window reloads via `ctx.storage` (keyed `hermes.plugin.followup-chips.choices`).
 - **Per-block isolation** — every `::followups` block is keyed `sessionId::directive-source`, so a new block always starts blank and never inherits an earlier choice.
 - **Any count** — `q1..qN` parsed in numeric order, no hard limit.
+- **Steer, when the chat is working** — `kind="multi"` and `kind="answer"` end with the send key and a small **Steer** button. Send queues the composed text as the next turn; Steer calls `session.steer` on the live turn and never falls back to the queue. If the turn refuses it, a warning appears and the block stays unsent, so the selection can be retried. On an idle chat Steer starts a normal turn.
 
 ## Why a plugin (and not a prompt/skill)
 

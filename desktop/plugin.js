@@ -225,10 +225,10 @@ function Chips(props) {
   const kind = kindRaw === 'multi' || kindRaw === 'answer' ? kindRaw : ''
   const primary = 'var(--dt-primary, var(--accent, var(--foreground)))'
 
-  function sendText(text) {
+  function sendText(text, forceSteer) {
     var submit = host && host.composer && host.composer.submit
-    var sent = typeof submit === 'function' ? submit(sessionId != null ? sessionId : null, text) : false
-    if (sent) {
+    var sid = sessionId != null && sessionId !== '' ? sessionId : null
+    function markSent() {
       const g = group(groupKey)
       g.running = true
       setActive(groupKey)
@@ -237,8 +237,43 @@ function Chips(props) {
       groups.forEach(function (_, k) {
         if (k !== groupKey) emit(k)
       })
-    } else if (host && host.notify) {
-      host.notify({ kind: 'warning', message: 'Open that chat to continue' })
+    }
+    function ordinary() {
+      var sent = typeof submit === 'function' ? submit(sid != null ? sid : null, text) : false
+      if (sent) markSent()
+      else if (host && host.notify) host.notify({ kind: 'warning', message: 'Open that chat to continue' })
+    }
+    /* Steer is per click: on a busy chat it addresses the live turn and never
+       degrades to a queued follow-up. With no turn running, a normal submit. */
+    if (!forceSteer || sid === null || !host || typeof host.request !== 'function') {
+      ordinary()
+      return true
+    }
+    var busy = false
+    try {
+      var atom = host.state && host.state.busyBySession
+      busy = Boolean(atom && typeof atom.get === 'function' && atom.get()[sid])
+    } catch (e) {
+      busy = false
+    }
+    if (!busy) {
+      ordinary()
+      return true
+    }
+    function refuse() {
+      if (host && host.notify) host.notify({ kind: 'warning', message: 'That turn would not take a steer' })
+    }
+    try {
+      Promise.resolve(host.request('session.steer', { session_id: sid, text: text }))
+        .then(function (res) {
+          if (res && res.status === 'queued' && res.delivered !== false) markSent()
+          else refuse()
+        })
+        .catch(function () {
+          refuse()
+        })
+    } catch (e) {
+      refuse()
     }
     return true
   }
@@ -339,7 +374,7 @@ function AnswerBlock(props) {
       return next
     })
   }
-  function sendAll() {
+  function sendAll(forceSteer) {
     const lines = []
     qs.forEach(function (q, i) {
       if (!picked[i]) return
@@ -347,7 +382,7 @@ function AnswerBlock(props) {
       lines.push(String(i + 1) + '. ' + q + (t ? ': ' + t : ''))
     })
     if (lines.length === 0) return
-    props.onSendText(lines.join('\n'))
+    props.onSendText(lines.join('\n'), forceSteer)
   }
   const rowStyle = {
     display: 'flex',
@@ -420,24 +455,56 @@ function AnswerBlock(props) {
     style: { display: 'flex', flexDirection: 'column', gap: '6px', width: '100%' },
     children: rows.concat([
       jsx(
-        'button',
+        'div',
         {
-          key: 'send',
-          type: 'button',
-          onClick: sendAll,
-          disabled: !anyPicked,
-          style: {
-            cursor: anyPicked ? 'pointer' : 'default',
-            alignSelf: 'flex-start',
-            border: '1px solid ' + (anyPicked ? 'color-mix(in srgb, ' + primary + ' 55%, transparent)' : 'var(--ui-stroke-secondary, var(--border))'),
-            borderRadius: '12px',
-            background: anyPicked ? 'color-mix(in srgb, ' + primary + ' 7%, transparent)' : 'transparent',
-            color: anyPicked ? primary : 'var(--ui-text-tertiary, var(--muted-foreground))',
-            padding: '4px 14px',
-            fontSize: '0.9em',
-            opacity: anyPicked ? 1 : 0.6,
-          },
-          children: '↵',
+          key: 'finalize',
+          style: { display: 'flex', justifyContent: 'flex-start', gap: '8px' },
+          children: [
+            jsx(
+              'button',
+              {
+                key: 'send',
+                type: 'button',
+                onClick: sendAll,
+                disabled: !anyPicked,
+                title: 'Send',
+                'aria-label': 'Send',
+                style: {
+                  cursor: anyPicked ? 'pointer' : 'default',
+                  border: '1px solid ' + (anyPicked ? 'color-mix(in srgb, ' + primary + ' 55%, transparent)' : 'var(--ui-stroke-secondary, var(--border))'),
+                  borderRadius: '12px',
+                  background: anyPicked ? 'color-mix(in srgb, ' + primary + ' 7%, transparent)' : 'transparent',
+                  color: anyPicked ? primary : 'var(--ui-text-tertiary, var(--muted-foreground))',
+                  padding: '4px 14px',
+                  fontSize: '0.9em',
+                  opacity: anyPicked ? 1 : 0.6,
+                },
+                children: '↵',
+              },
+            ),
+            jsx(
+              'button',
+              {
+                key: 'steer',
+                type: 'button',
+                onClick: function () { sendAll(true) },
+                disabled: !anyPicked,
+                title: 'Steer the running turn instead of queueing',
+                'aria-label': 'Steer',
+                style: {
+                  cursor: anyPicked ? 'pointer' : 'default',
+                  border: '1px solid ' + (anyPicked ? 'color-mix(in srgb, ' + primary + ' 42%, transparent)' : 'var(--ui-stroke-secondary, var(--border))'),
+                  borderRadius: '12px',
+                  background: 'transparent',
+                  color: anyPicked ? primary : 'var(--ui-text-tertiary, var(--muted-foreground))',
+                  padding: '4px 10px',
+                  fontSize: '0.78em',
+                  opacity: anyPicked ? 0.9 : 0.6,
+                },
+                children: 'Steer',
+              },
+            ),
+          ],
         },
       ),
     ]),

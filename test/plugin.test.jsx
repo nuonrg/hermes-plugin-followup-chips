@@ -3,7 +3,7 @@ import { JSDOM } from 'jsdom'
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 
-import { host, lastSubmission, resetSubmissionLog, makeCtx } from './sdk-stub.js'
+import { host, lastSubmission, resetSubmissionLog, makeCtx, setBusy, resetBusy, requestLog, resetRequestLog, setRequestResult } from './sdk-stub.js'
 
 // The REAL plugin, unmodified - the vite alias resolves its SDK import to the stub.
 const pluginModule = await import('../plugin.js')
@@ -44,6 +44,8 @@ function click(s, el) {
 
 beforeEach(() => {
   resetSubmissionLog()
+  resetRequestLog()
+  resetBusy()
 })
 
 describe('plain chips (no kind)', () => {
@@ -104,6 +106,89 @@ describe('kind="answer"', () => {
     expect(btn).toBeTruthy()
     click(s, btn)
     expect(lastSubmission().text).toBe('1. Deploy?: yes, at 16:00')
+  })
+})
+
+
+describe('steer button', () => {
+  function buttonsWithLabels(root) {
+    return {
+      send: root.querySelector('button[aria-label="Send"]'),
+      steer: root.querySelector('button[aria-label="Steer"]'),
+    }
+  }
+
+  it('draws Steer beside the existing send key, disabled until a row is picked', () => {
+    const s = newSession()
+    const root = mount(renderBlock({ kind: 'multi', q1: 'Alpha', q2: 'Beta' }, 'src'), s)
+    const btn = buttonsWithLabels(root)
+    expect(btn.send).toBeTruthy()
+    expect(btn.steer).toBeTruthy()
+    expect(btn.send.textContent).toBe('↵')
+    expect(btn.steer.textContent).toBe('Steer')
+    expect(btn.steer.disabled).toBe(true)
+    act(() => {
+      root.querySelectorAll('input[type=checkbox]')[1].click()
+    })
+    expect(btn.steer.disabled).toBe(false)
+  })
+
+  it('busy: Steer reaches the live turn and sends no composer submission', async () => {
+    setBusy(true)
+    const s = newSession()
+    const root = mount(renderBlock({ kind: 'multi', q1: 'Alpha', q2: 'Beta' }, 'src'), s)
+    act(() => {
+      root.querySelectorAll('input[type=checkbox]')[1].click()
+    })
+    click(s, buttonsWithLabels(root).steer)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(requestLog()).toEqual([
+      { method: 'session.steer', params: { session_id: 'sess-1', text: '2. Beta' } },
+    ])
+    expect(lastSubmission()).toBeNull()
+    resetBusy()
+  })
+
+  it('busy: a refused steer warns and leaves the block unsent', async () => {
+    setBusy(true)
+    setRequestResult(() => Promise.resolve({ status: 'rejected', delivered: false }))
+    const s = newSession()
+    const root = mount(renderBlock({ kind: 'multi', q1: 'Alpha', q2: 'Beta' }, 'src'), s)
+    act(() => {
+      root.querySelectorAll('input[type=checkbox]')[0].click()
+    })
+    click(s, buttonsWithLabels(root).steer)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(requestLog().map((r) => r.method)).toEqual(['session.steer'])
+    expect(lastSubmission().notify.message).toBe('That turn would not take a steer')
+    expect(buttonsWithLabels(root).send.disabled).toBe(false)
+    resetBusy()
+    setRequestResult(null)
+  })
+
+  it('idle: Steer starts a normal turn', async () => {
+    const s = newSession()
+    const root = mount(renderBlock({ kind: 'answer', q1: 'Deploy?', q2: 'Tag?' }, 'src'), s)
+    act(() => {
+      root.querySelectorAll('input[type=checkbox]')[1].click()
+    })
+    click(s, buttonsWithLabels(root).steer)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(requestLog()).toEqual([])
+    expect(lastSubmission().text).toBe('2. Tag?')
+  })
+
+  it('the Enter key in an answer field still sends normally', async () => {
+    const s = newSession()
+    const root = mount(renderBlock({ kind: 'answer', q1: 'Deploy?' }, 'src'), s)
+    act(() => {
+      root.querySelectorAll('input[type=checkbox]')[0].click()
+      const field = root.querySelector('input[type=text]')
+      field.dispatchEvent(new s.dom.window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(requestLog()).toEqual([])
+    expect(lastSubmission().text).toBe('1. Deploy?')
   })
 })
 

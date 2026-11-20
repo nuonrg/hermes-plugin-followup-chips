@@ -3,6 +3,11 @@
 All notable changes to followup-chips are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/); dates in Europe/Amsterdam.
 
+## [Unreleased]
+
+### Added
+- A small **Steer** button beside the send key in `kind="multi"` and `kind="answer"` blocks. It sends the composed selection into the running turn through `session.steer`, without the queue fallback the plain send path uses. A refused steer warns and leaves the block unsent; with no turn running it starts a normal turn. Plain chips are unchanged.
+
 ## [1.2.0] - 2026-11-19
 
 ### Added
